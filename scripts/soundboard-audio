@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# yami.soundboard — PipeWire virtual-mic plumbing.
+#
+# Builds / tears down the three modules the soundboard needs:
+#   module-null-sink     -> soundboard.mix            ("Soundboard-Mix")
+#   module-loopback      -> <resolved mic> + soundboard.mix   (voice into mix)
+#   module-remap-source  -> soundboard.mix.monitor -> soundboard.mic
+#                                                        ("Soundboard-Mic")
+# The conferencing app selects "Soundboard-Mic"; the system default
+# source/sink are NEVER modified (SPEC invariant 1).
+#
+# Usage:
+#   soundboard-audio setup [--mic NODENAME]
+#   soundboard-audio refresh-mic [--mic NODENAME]
+#   soundboard-audio teardown
+#   soundboard-audio status [--json]
+#
+# Module ids are persisted in $STATE_FILE so `teardown` unloads exactly the
+# modules this plugin created. `setup` additionally recognizes stranded
+# modules by their unique object names, so a lost state file never causes
+# duplicates (SPEC invariant 3).
+
+set -u
+
+SINK="soundboard.mix"
+MIC="soundboard.mic"
+
+STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/yami.soundboard"
+STATE_FILE="$STATE_DIR/modules.json"
+
+CMD="${1:-status}"
+[ $# -gt 0 ] && shift
+
+# ---------------------------------------------------------------- helpers
+
+log()  { printf 'soundboard-audio: %s\n' "$*"; }
+warn() { printf 'soundboard-audio: WARN: %s\n' "$*" >&2; }
+die()  { printf 'soundboard-audio: ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Pactl module record = everything after a "Module #<id>:" heading. Args may
+# be multiline, so split records on "Module #" and match the whole record.
+find_module() {
+  local tag="$1"
+  pactl list modules | awk -v t="$tag" '
+    BEGIN { RS = "Module #" }
+    NR > 1 && index($0, t) { id = $1; sub(/:.*/, "", id); print id }
+  ' | sort -un
+}
+
+# node name of the `source=<x>` argument of our loopback module(s)
+loopback_source() {
+  pactl list modules | awk '
+    BEGIN { RS = "Module #" }
+    NR > 1 && /sink=soundboard\.mix[^.a-zA-Z]/ && /module-loopback/ {
+      if (match($0, /source=[A-Za-z0-9_.<>-]+/)) {
+        print substr($0, RSTART + 7, RLENGTH - 7)
+        exit
+      }
+    }
+  '
+}
+
+source_exists() { pactl list short sources | awk -v n="$1" '$2 == n { f = 1 } END { exit f ? 0 : 1 }'; }
+sink_exists()   { pactl list short sinks   | awk -v n="$1" '$2 == n { f = 1 } END { exit f ? 0 : 1 }'; }
+
+# The mix sink is registered asynchronously. If module-remap-source is loaded
+# before its monitor exists, WirePlumber autoconnects that record stream to the
+# DEFAULT sink's monitor, so the virtual mic then carries speaker audio (or
+# silence) instead of the pads. Waiting for the node, then verifying and
+# re-pointing the stream, removes that race.
+wait_for_node() {
+  local name="$1" tries="${2:-60}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    pw-dump 2>/dev/null | grep -q "\"node.name\": \"$name\"" && return 0
+    i=$((i + 1)); sleep 0.05
+  done
+  return 1
+}
+
+# Source output (record stream) owned by our remap module, by pulse index.
+# The state file is written at the end of setup and removed by teardown, so
+# fall back to finding the module by its unique source name.
+remap_output_id() {
+  local mid
+  mid="$(state_field remap 2>/dev/null || true)"
+  [ -n "$mid" ] || mid="$(find_module "source_name=${MIC}" | head -n1)"
+  [ -n "$mid" ] || return 1
+  pactl list source-outputs | awk -v m="$mid" '
+    /^Source Output #[0-9]+/ { idx = $3; sub(/#/, "", idx) }
+    index($0, "Owner Module: " m) > 0 { print idx; exit }
+  '
+}
+
+source_name_of_index() {
+  pactl list short sources | awk -v i="$1" '$1 == i { print $2; exit }'
+}
+
+source_output_source_index() {
+  pactl list source-outputs | awk -v id="$1" '
+    $0 == "Source Output #" id { found = 1; next }
+    found && /^[[:space:]]+Source: / { print $2; exit }
+  '
+}
+
+pin_remap_feed() {
+  local idx src cur tries="${1:-60}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    idx="$(remap_output_id 2>/dev/null || true)"
+    if [ -n "$idx" ]; then
+      cur="$(source_output_source_index "$idx")"
+      src="$(source_name_of_index "$cur")"
+      [ "$src" = "$SINK.monitor" ] && return 0
+      if pactl move-source-output "$idx" "$SINK.monitor" >/dev/null 2>&1; then
+        log "re-pointed virtual mic feed: ${src:-unknown} -> $SINK.monitor"
+        return 0
+      fi
+    fi
+    i=$((i + 1)); sleep 0.05
+  done
+  warn "virtual mic feed is not $SINK.monitor; audio may not reach the mic"
+  return 1
+}
+
+default_source() { pactl get-default-source 2>/dev/null | head -n1; }
+default_sink()   { pactl get-default-sink   2>/dev/null | head -n1; }
+
+# Feedback guard (invariant 2): the loopback must never tap our own virtual
+# mic / mix / monitor — that feeds pad output straight back into the mic.
+is_feedback() {
+  case "$1" in
+    "$MIC"|"$MIC".*|soundboard.mix|soundboard.mix.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+first_hardware_mic() {
+  pactl list short sources | awk '$2 ~ /^alsa_input\./ && $2 !~ /\.monitor$/ { print $2; exit }'
+}
+
+# Mic resolution order (invariant 5):
+#   1. explicit pin (--mic; forwarded from the Service's micSource setting)
+#   2. omavoice            (keeps denoise in the path)
+#   3. system default source
+#   4. first non-monitor hardware source
+# Everything passes through the feedback guard.
+resolve_mic() {
+  local pin="${1:-}" cand
+
+  # When unpinned and omavoice is momentarily absent (shell-wide hot reload
+  # recreates every plugin's service at once), wait briefly for it instead of
+  # latching the loopback onto the wrong fallback for the whole session.
+  if [ -z "$pin" ] && ! source_exists "omavoice"; then
+    local waited=0
+    while [ "$waited" -lt 20 ]; do
+      sleep 0.25
+      waited=$((waited + 1))
+      source_exists "omavoice" && break
+    done
+  fi
+
+  # NOTE: the state file's mic field records the *last resolution*; it is not
+  # a pin. Only --mic expresses a user pin.
+
+  for cand in "$pin" "omavoice" "$(default_source)"; do
+    [ -n "$cand" ] || continue
+    source_exists "$cand" || continue
+    if is_feedback "$cand"; then
+      warn "feedback guard: '$cand' is our own virtual device; skipping it"
+      break
+    fi
+    printf '%s\n' "$cand"
+    return 0
+  done
+
+  cand="$(first_hardware_mic)"
+  if [ -n "$cand" ] && ! is_feedback "$cand"; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+  return 1
+}
+
+state_field() { # $1 = key -> value from modules.json
+  [ -f "$STATE_FILE" ] || return 1
+  jq -er --arg k "$1" '.[$k] // empty | tostring' "$STATE_FILE"
+}
+
+write_state() {
+  # $1=micNode  ";"-joined ids of mix,loopback,remap for bookkeeping
+  mkdir -p "$STATE_DIR"
+  local tmp="$STATE_FILE.tmp.$$"
+  local mixs loopid remapid
+  mixs="$(find_module "sink_name=${SINK}" | head -n1)"
+  loopid="$(find_module "sink=${SINK}" | head -n1)"
+  remapid="$(find_module "source_name=${MIC}" | head -n1)"
+  jq -n --arg mix "$mixs" --arg loop "$loopid" --arg remap "$remapid" --arg mic "${1:-}" \
+    '{ version: 1,
+       mix:      (if $mix   == "" then null else ($mix | tonumber) end),
+       loopback: (if $loop  == "" then null else ($loop | tonumber) end),
+       remap:    (if $remap == "" then null else ($remap | tonumber) end),
+       mic: $mic }' > "$tmp" && mv -f "$tmp" "$STATE_FILE"
+}
+
+# ids of modules attributable to this plugin (state file + name-recognized)
+plugin_module_ids() {
+  { find_module "sink_name=${SINK}"
+    find_module "sink=${SINK}" 2>/dev/null # loopback's sink arg (no sink_name=)
+    find_module "source_name=${MIC}"
+    find_module "master=${SINK}.monitor"
+    local f; f="$STATE_FILE"
+    jq -r '[(.mix // ""), (.loopback // ""), (.remap // "")] | .[]' "$f" 2>/dev/null
+  } | sort -un
+}
+
+# ---------------------------------------------------------------- commands
+
+do_setup() {
+  local pin="" opt
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mic) pin="${2-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # serialize against concurrent setup/teardown runs (a stale keepLoaded
+  # instance's teardown can arrive while a fresh instance's setup runs)
+  mkdir -p "$STATE_DIR"
+  (
+    flock -w 15 200 || : # proceed best-effort if flock is unavailable
+    _do_setup_body "$pin"
+  ) 200>"$STATE_DIR.lock"
+  return 0
+}
+
+_do_setup_body() {
+  local pin="$1"
+  # Names are hyphenated on purpose. pipewire-pulse splits *_properties at the
+  # first space and ignores quoting, so "Soundboard Mic" arrives as
+  # node.description="Soundboard". Verified on PipeWire 1.6.9: three quoting
+  # forms all truncate, `pw-cli set-param` does not stick, and WirePlumber
+  # 0.5.18 has no node.rules section to override it. Do not "fix" these back
+  # to spaced names — the device name would silently lose its second word and
+  # stop matching what the UI tells the user to pick.
+  if ! sink_exists "$SINK"; then
+    local mix_id
+    mix_id="$(pactl load-module module-null-sink \
+      "sink_name=${SINK}" \
+      sink_properties=device.description=Soundboard-Mix)" \
+      || die "could not load module-null-sink"
+    log "loaded mix sink $SINK (module $mix_id)"
+  fi
+
+  # 2. remap source (expose the mix as a real input device)
+  wait_for_node "$SINK" || warn "mix sink node slow to appear; wiring the mic anyway"
+  if ! source_exists "$MIC"; then
+    local remap_id
+    remap_id="$(pactl load-module module-remap-source \
+      "master=${SINK}.monitor" \
+      "source_name=${MIC}" \
+      source_properties=device.description=Soundboard-Mic)" \
+      || die "could not load module-remap-source"
+    log "loaded virtual mic $MIC (module $remap_id)"
+  fi
+
+  # Reuse or not, never trust autoconnect for the virtual mic's feed.
+  pin_remap_feed || true
+
+  # 3. voice loopback, guard-resolved
+  local mic loop_rc=0
+  mic="$(resolve_mic "$pin")" || mic=""
+  if [ -n "$mic" ]; then
+    do_loopback "$mic" || loop_rc=$?
+  else
+    warn "no microphone resolved; soundboard.mic exists but carries only pad audio"
+  fi
+
+  write_state "$mic"
+  # State is now on disk; re-assert the mic feed once more so a teardown that
+  # cleared it mid-setup cannot leave the virtual mic pointing at the speakers.
+  pin_remap_feed >/dev/null 2>&1 || true
+  # post-flight recheck: a teardown racing past the lock (or an external
+  # tool) may have dropped the voice loopback; retry once before failing
+  if [ -n "$mic" ] && [ "$mic" != "$(loopback_source)" ]; then
+    log "voice loopback missing after setup; retrying"
+    do_loopback "$mic" || true
+  fi
+  if [ "$mic" = "$(loopback_source)" ] && sink_exists "$SINK" && source_exists "$MIC"; then
+    log "ready: $MIC (voice from: ${mic:-none})"
+  else
+    return 1
+  fi
+}
+
+do_loopback() { # $1 = mic node; idempotent, re-points when the node changed
+  local mic="$1" cur id
+  cur="$(loopback_source)"
+
+  if [ "$cur" = "$mic" ]; then
+    return 0 # already correct
+  fi
+
+  if [ -n "$cur" ]; then
+    log "re-pointing loopback: $cur -> $mic"
+    for id in $(find_module "sink=${SINK}" 2>/dev/null); do
+      pactl unload-module "$id" >/dev/null 2>&1 || warn "could not unload stale loopback module $id"
+    done
+  fi
+
+  pactl load-module module-loopback \
+    "source=${mic}" "sink=${SINK}" \
+    latency_msec=20 source_dont_move=true sink_dont_move=true >/dev/null \
+    || { warn "module-loopback load failed"; return 1; }
+  return 0
+}
+
+cmd_setup() { do_setup "$@"; }
+
+cmd_refresh_mic() { # re-resolve (idempotent) and re-point just the loopback
+  do_setup "$@"
+}
+
+do_teardown() {
+  local id
+  for id in $(plugin_module_ids); do
+    [ -n "$id" ] || continue
+    if pactl unload-module "$id" >/dev/null 2>&1; then
+      log "unloaded module $id"
+    fi
+  done
+
+  rm -f "$STATE_FILE"
+
+  # confirm: exactly our objects are gone; defaults never touched
+  local plist=0
+  sink_exists "$SINK" && { warn "$SINK still present after teardown"; plist=1; }
+  source_exists "$MIC" && { warn "$MIC still present after teardown"; plist=1; }
+  [ "$plist" = 1 ] && return 1
+  log "teardown complete (default source/sink untouched)"
+  return 0
+}
+
+cmd_teardown() {
+  # serialize against concurrent setup/refresh runs (see do_setup)
+  mkdir -p "$STATE_DIR"
+  (
+    flock -w 15 200 || : # proceed best-effort if flock is unavailable
+    do_teardown
+  ) 200>"$STATE_DIR.lock"
+}
+
+# Cheap, silent re-assertion of the virtual mic's feed. Omavoice re-creates its
+# AEC graph on shell restart or preset change and WirePlumber can move our remap
+# stream to the default sink monitor afterwards; the mic then looks healthy but
+# carries no pads. Called periodically by the service.
+cmd_pin() {
+  wait_for_node "$SINK" 20 >/dev/null 2>&1 || return 1
+  source_exists "$MIC" || return 1
+  pin_remap_feed 20 >/dev/null 2>&1
+}
+
+cmd_status() {
+  local as_json=0 opt
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  local mix_id loop_id remap_id loop_src dsrc dsink ready
+  mix_id="$(find_module "sink_name=${SINK}" | head -n1)"
+  loop_id="$(find_module "sink=${SINK}" | head -n1)"
+  remap_id="$(find_module "source_name=${MIC}" | head -n1)"
+  loop_src="$(loopback_source)"
+  dsrc="$(default_source)"
+  dsink="$(default_sink)"
+
+  ready="false"
+  if sink_exists "$SINK" && source_exists "$MIC" && [ -n "$loop_src" ] && source_exists "$loop_src"; then
+    ready="true"
+  fi
+
+  if [ "$as_json" = 1 ]; then
+    local candidates
+    candidates="$(pactl -f json list sources 2>/dev/null | jq -c '
+      [ .[] | {
+          nodeName:   .name,
+          description: (.properties["device.description"] // .name),
+          available:   ((.properties["state"] // "") != "UNKNOWN")
+        } ]' 2>/dev/null)" || candidates="[]"
+    [ -n "$candidates" ] || candidates="[]"
+    jq -cn \
+      --arg sink "$SINK" --arg mic "$MIC" --arg micSrc "${loop_src:-}" \
+      --arg dsrc "$dsrc" --arg dsink "$dsink" \
+      --arg mixId "${mix_id:-}" --arg loopId "${loop_id:-}" --arg remapId "${remap_id:-}" \
+      --argjson candidates "$candidates" \
+      --arg ready "$ready" \
+      '{
+        ready: ($ready == "true"),
+        mixSink: $sink,
+        mixMonitor: ($sink + ".monitor"),
+        virtualMic: $mic,
+        micSource: $micSrc,
+        defaultSource: $dsrc,
+        defaultSink: $dsink,
+        modules: {
+          mix:      (if $mixId   == "" then null else ($mixId   | tonumber) end),
+          loopback: (if $loopId  == "" then null else ($loopId  | tonumber) end),
+          remap:    (if $remapId == "" then null else ($remapId | tonumber) end)
+        },
+        micCandidates: $candidates
+      }'
+    return 0
+  fi
+
+  printf 'sink=%s source=%s loopback_from=%s\n' "$SINK" "$MIC" "${loop_src:-none}"
+  printf 'modules: mix=%s loopback=%s remap=%s\n' "${mix_id//-/none}" "${loop_id:-none}" "${remap_id:-none}"
+  printf 'defaults: sink=%s source=%s\n' "$dsink" "$dsrc"
+  if [ "$ready" = "true" ]; then printf 'status=ready\n'; else printf 'status=not-ready\n'; fi
+}
+
+case "$CMD" in
+  setup)       cmd_setup "$@" ;;
+  refresh-mic) cmd_refresh_mic "$@" ;;
+  teardown)    cmd_teardown "$@" ;;
+  pin)         cmd_pin "$@" ;;
+  status)      cmd_status "$@" ;;
+  *)           die "unknown command '$CMD' (setup|refresh-mic|teardown|pin|status)" ;;
+esac

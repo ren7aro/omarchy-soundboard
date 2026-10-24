@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# yami.soundboard — thin CLI wrapper over the shell's IPC.
+#
+#   soundboard play N      play the Nth pad (slot N, ALT + N order)
+#   soundboard stop N      stop the Nth pad
+#   soundboard stopall     stop every pad
+#   soundboard status      live state of the service (JSON)
+#
+# exit destination: omarchy-shell; the IPC handler target is "soundboard"
+# (declared in the plugin's Service.qml). Without -q it prints errors when
+# the shell or the target is unavailable and relays a non-zero exit code.
+
+set -u
+
+usage() {
+  cat <<EOF
+usage: soundboard [--quiet|-q] play N | stop N | stopall | status
+       N is a slot: 1..12 (ALT + 1..9, Q, W, E)
+EOF
+}
+
+mode=""
+case "${1-}" in
+  -q|--quiet) mode="-q"; shift ;;
+  -h|--help) usage; exit 0 ;;
+esac
+
+cmd="${1-}"
+[ -n "$cmd" ] || { usage; exit 2; }
+shift
+
+case "$cmd" in
+  play|stop)
+    n="${1-}"
+    case "$n" in
+      ''|*[!0-9]*) usage; exit 2 ;;
+    esac
+    if [ "$n" -lt 1 ] || [ "$n" -gt 12 ]; then usage; exit 2; fi
+    exec omarchy-shell $mode soundboard "$cmd" "$n"
+    ;;
+  stopall)
+    exec omarchy-shell $mode soundboard stopAll
+    ;;
+  status)
+    if ! out="$(omarchy-shell soundboard status)"; then
+      echo "soundboard: the shell did not answer (is omarchy-shell running and the plugin enabled?)" >&2
+      exit 1
+    fi
+    if [ "$out" = "unknown method" ] || [ -z "$out" ]; then
+      echo "soundboard: target not reachable — is the plugin enabled?" >&2
+      exit 1
+    fi
+    if command -v jq >/dev/null 2>&1 && [ "$mode" != "-q" ]; then
+      echo "$out" | jq .
+    else
+      echo "$out"
+    fi
+    ;;
+  *) usage; exit 2 ;;
+esac

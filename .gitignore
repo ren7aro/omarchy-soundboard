@@ -1,0 +1,11 @@
+# Editor / OS noise
+*~
+*.swp
+.DS_Store
+
+# Local test artifacts
+/tmp/
+*.log
+
+# Nothing in this repo is generated: manifest, QML, scripts and docs are the
+# plugin. Keep the tree exactly what `omarchy plugin add` should clone.

@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "yami.soundboard",
+  "name": "Soundboard",
+  "version": "1.0.0",
+  "description": "Pads in the bar, hotkeys while Discord/Zoom has focus, and a virtual mic that carries your voice + the sounds on one device.",
+  "author": "yami",
+  "license": "MIT",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Soundboard",
+    "description": "Pads in the bar, hotkeys while Discord/Zoom has focus, and a virtual mic that carries your voice + the sounds on one device.",
+    "category": "Audio",
+    "aliases": ["soundboard", "sfx", "voice"],
+    "defaultSection": "right",
+    "defaults": {
+      "masterVolume": 1.0,
+      "monitorLocally": true,
+      "micSource": ""
+    },
+    "schema": [
+      {
+        "key": "monitorLocally",
+        "type": "boolean",
+        "label": "Monitor pads locally",
+        "defaultValue": true,
+        "description": "Also play pads on your speakers/headphones. Warning: on open speakers the mic can re-capture the pad."
+      },
+      {
+        "key": "micSource",
+        "type": "string",
+        "label": "Voice source",
+        "defaultValue": "",
+        "description": "Pinned PipeWire source feeding the soundboard mic. Leave empty to auto-detect (omavoice, then default, then hardware)."
+      }
+    ]
+  }
+}

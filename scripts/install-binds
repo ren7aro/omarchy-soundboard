@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# yami.soundboard — install the 12 pad hotkeys into ~/.config/hypr/bindings.lua.
+#
+#   install-binds [--dry-run]        insert / replace the marked block
+#   install-binds --remove [--dry-run]
+#   install-binds --file <path>      operate on a different lua file (test use)
+#
+# Idempotent: the block between the yami.soundboard markers is replaced as a
+# whole; every other line passes through byte-for-byte. A second (duplicated)
+# marked block is dropped, so accidental double installs self-heal. Without
+# a block the block is appended at the end. Nothing runs against Hyprland
+# here — after a real install, run: hyprctl reload && hyprctl configerrors
+
+set -euo pipefail
+exec /usr/bin/env python3 - "$@" <<'PY'
+import os, sys, tempfile
+
+home = os.environ.get("HOME", "")
+path = os.path.join(home, ".config/hypr/bindings.lua")
+mode = "install"
+dry = False
+
+args = sys.argv[1:]
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--dry-run": dry = True
+    elif a == "--remove": mode = "remove"
+    elif a == "--file":
+        i += 1
+        if i >= len(args): print("--file needs a value", file=sys.stderr); sys.exit(2)
+        path = args[i]
+    elif a in ("-h", "--help", "help"):
+        print("usage: install-binds [--remove] [--dry-run] [--file bindings.lua]")
+        sys.exit(0)
+    else:
+        print("unknown option: " + a, file=sys.stderr); sys.exit(2)
+    i += 1
+
+MARK_A = "-- >>> yami.soundboard >>>"
+MARK_B = "-- <<< yami.soundboard <<<"
+
+BINDS = [
+    'o.bind("ALT + 1", "Soundboard pad 1",  "omarchy-shell -q soundboard play 1")',
+    'o.bind("ALT + 2", "Soundboard pad 2",  "omarchy-shell -q soundboard play 2")',
+    'o.bind("ALT + 3", "Soundboard pad 3",  "omarchy-shell -q soundboard play 3")',
+    'o.bind("ALT + 4", "Soundboard pad 4",  "omarchy-shell -q soundboard play 4")',
+    'o.bind("ALT + 5", "Soundboard pad 5",  "omarchy-shell -q soundboard play 5")',
+    'o.bind("ALT + 6", "Soundboard pad 6",  "omarchy-shell -q soundboard play 6")',
+    'o.bind("ALT + 7", "Soundboard pad 7",  "omarchy-shell -q soundboard play 7")',
+    'o.bind("ALT + 8", "Soundboard pad 8",  "omarchy-shell -q soundboard play 8")',
+    'o.bind("ALT + 9", "Soundboard pad 9",  "omarchy-shell -q soundboard play 9")',
+    'o.bind("ALT + Q", "Soundboard pad 10", "omarchy-shell -q soundboard play 10")',
+    'o.bind("ALT + W", "Soundboard pad 11", "omarchy-shell -q soundboard play 11")',
+    'o.bind("ALT + E", "Soundboard pad 12", "omarchy-shell -q soundboard play 12")',
+]
+BLOCK = "\n".join([MARK_A,
+                   "-- yami.soundboard — installed by the plugin's scripts/install-binds.",
+                   "-- 12 slots, assigned in pad order (see the pad panel)."] + BINDS +
+                  [MARK_B])
+
+if not os.path.isfile(path):
+    if mode == "remove":
+        print("nothing to remove: %s does not exist" % path); sys.exit(0)
+    print("error: %s does not exist" % path, file=sys.stderr); sys.exit(1)
+
+with open(path, "r", encoding="utf-8") as f:
+    text_in = f.read()
+ends_with_newline = text_in.endswith("\n")
+lines = text_in.split("\n")
+# split leaves ONE artifact element after the final newline; exactly one pop
+if lines and lines[-1] == "":
+    lines.pop()
+
+# locate every marked block
+pairs = []
+cur = None
+for i, l in enumerate(lines):
+    if l.strip() == MARK_A and cur is None:
+        cur = i
+    elif l.strip() == MARK_B and cur is not None:
+        pairs.append((cur, i)); cur = None
+if cur is not None:  # unpaired marker — refuse
+    print("error: unpaired yami.soundboard marker in %s; refusing to touch the file" % path, file=sys.stderr)
+    sys.exit(1)
+if len(pairs) > 1:
+    print("note: %d yami.soundboard blocks found; will keep only the first" % len(pairs))
+
+def writeback(result, action):
+    text = "\n".join(result) + "\n"
+    if dry:
+        print(">>> dry run — %s would be applied to %s:" % (action, path))
+        for l in result:
+            print(l)
+        return
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".install-binds.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    print("%s: %s (%d lines)" % (path, action, len(result)))
+
+if mode == "remove":
+    if not pairs:
+        print("nothing to remove: no yami.soundboard block in %s" % path)
+        sys.exit(0)
+    spans = set()
+    for a, b in pairs:
+        for j in range(a, b + 1): spans.add(j)
+    result = [l for j, l in enumerate(lines) if j not in spans]
+    # drop the empty separator line that sat above the first removed block
+    if pairs[0][0] < len(result) and result[pairs[0][0]] == "":
+        result.pop(pairs[0][0])
+    writeback(result, "removed block")
+else:
+    if pairs:
+        spans = set()
+        for a, b in pairs:
+            for j in range(a, b + 1): spans.add(j)
+        out, skip = [], False
+        fresh = False
+        for j, l in enumerate(lines):
+            if j in spans:
+                if not fresh:
+                    out.extend(BLOCK.split("\n"))
+                    fresh = True
+                continue
+            out.append(l)
+        writeback(out, "replaced block(s)")
+    else:
+        # append at the end; do not add another blank seam if the file
+        # already ends with blank line(s)
+        result = list(lines)
+        if result and result[-1].strip() == "":
+            result.extend(BLOCK.split("\n"))
+        else:
+            result.extend([""] + BLOCK.split("\n"))
+        writeback(result, "appended block")
+PY
