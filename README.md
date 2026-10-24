@@ -22,6 +22,43 @@ conferencing app in by picking **Soundboard-Mic** as its microphone.
 - `ffmpeg` only for containers `pw-play` cannot decode (m4a/opus/webm); wav,
   mp3, flac and ogg play natively
 
+## Dependencies: none on other plugins
+
+**No other Omarchy plugin is required.** The only mention of another plugin is a
+*preference*, not a dependency: if a source node named `omavoice` exists, the
+voice loopback taps it so Omavoice's denoise stays in the path.
+
+Resolution order (`scripts/soundboard-audio`, invariant 5) is:
+
+1. an explicitly pinned `micSource`
+2. `omavoice`, if that node exists
+3. your system default source
+4. the first non-monitor hardware mic
+
+A feedback guard skips `soundboard.mic` / `soundboard.mix*` at every step, so it
+can never tap its own output. When unpinned and `omavoice` is momentarily absent
+(shell-wide reload recreates every plugin's service at once) it waits up to 5 s
+for it before falling back.
+
+What that means on a machine without Omavoice:
+
+- **The plugin still works.** `soundboard.mic` is created, pads play into it, and
+  your voice is looped in from the default microphone — one device carrying
+  voice + sounds, just without denoise.
+- **No microphone at all** (no hardware source): `soundboard.mic` still exists
+  but carries pad audio only, and `setup` logs
+  `no microphone resolved; soundboard.mic exists but carries only pad audio`.
+  A conferencing app would hear the sounds but not you.
+- **Omavoice installed later, or the default mic changed:** the loopback keeps
+  its old source, because the 5 s self-heal only re-pins the remap feed.
+  Re-resolve explicitly:
+
+  ```sh
+  ~/.config/omarchy/plugins/yami.soundboard/scripts/soundboard-audio refresh-mic
+  ```
+
+  (A plugin disable/enable or `omarchy restart shell` does the same via setup.)
+
 ## Install
 
 ```sh
