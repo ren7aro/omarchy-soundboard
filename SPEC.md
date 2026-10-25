@@ -101,6 +101,13 @@ Reading a pad's live state: an audio stream is NOT required; the UI tracks
    (220 ms timer) before calling `svc.pickFiles()`. Never spawn a chooser from
    inside the drawer, and never use `Qt.callLater` for that handoff — it fires
    while the overlay still owns the screen.
+8. **The mix sink is a bus at unity gain; master volume is per stream.**
+   `soundboard.mix` sums pads *and* the voice loopback, so its volume must stay
+   at 100 % — scaling it attenuates the user's voice for the far end by the same
+   amount (that was a real bug: master 50 % made the user 18 dB quieter). Master
+   is baked into each player's `--volume` as `padVolume × masterVolume`, and the
+   local monitor copy uses the identical value, so the local preview is honest
+   and 0 % is silent on both paths. Never reintroduce sink-volume master.
 
 ### Monitoring locally
 
@@ -252,7 +259,7 @@ property string lastError        // human-readable, "" when fine
 property var    pads             // [{ id, name, path, volume, slot, missing }]
 property var    playing          // { padId: playerIndex } — drives the glow
 property int    activeCount      // number of sounds currently audible
-property real   masterVolume     // 0..1
+property real   masterVolume     // 0..1 per-pad stream gain; the sink stays 100%
 property bool   monitorLocally   // mirror pads to the system default sink
 property string micSource        // "" = auto, else pinned node name
 property var    micCandidates    // [{ nodeName, description, available }]

@@ -36,7 +36,7 @@ Scope {
   property var pads: []                      // [{ id, name, path, volume, slot, missing, key }]
   property var playing: ({})                 // { padId: true } — main players live
   property int activeCount: 0                // sounds currently audible
-  property real masterVolume: 1.0            // 0..1  → soundboard.mix sink volume
+  property real masterVolume: 1.0            // 0..1 → per-pad stream gain (never the mix sink)
   property bool monitorLocally: true         // mirror pads to the system default sink
   property string micSource: ""              // "" = auto, else pinned source node
   property var micCandidates: []             // [{ nodeName, description, available }]
@@ -258,7 +258,13 @@ Scope {
     root._killPad(pad.id)
 
     var file = String(store.path)
-    var vol = root._clamp01(store.volume === undefined ? 1 : store.volume).toFixed(2)
+    var padVol = root._clamp01(store.volume === undefined ? 1 : store.volume)
+    // Master is applied per stream, never on the mix sink: that sink also
+    // carries the voice loopback, so scaling it would make the far end hear
+    // the user quieter by the same amount. Stream gain keeps the voice at
+    // unity, and because the local monitor copy uses this same value, what you
+    // hear is what they hear (0 % is genuinely silent on both paths).
+    var vol = (padVol * root._clamp01(root.masterVolume)).toFixed(3)
     var ext = (file.lastIndexOf(".") >= 0)
       ? file.substring(file.lastIndexOf(".") + 1).toLowerCase() : ""
 
@@ -522,12 +528,19 @@ Scope {
   function setMasterVolume(v) {
     root.masterVolume = root._clamp01(v)
     saveLibrary()
-    var pct = Math.round(root.masterVolume * 100) + "%"
+    root._normalizeMixVolume()
+  }
+
+  // The mix sink is a summing bus for pads *and* the voice loopback, so its
+  // volume is not ours to scale — pad gain lives on the player streams. Older
+  // builds did store master there (attenuating the user's voice with it), so
+  // reset it to unity whenever master moves and after every setup.
+  function _normalizeMixVolume() {
     Quickshell.execDetached([
       "bash", "-c",
       'sink_exists() { pactl list short sinks | awk -v n="$1" \'{ if ($2 == n) f = 1 } END { exit f ? 0 : 1 }\'; }\n' +
-      'sink_exists soundboard.mix && pactl set-sink-volume soundboard.mix "$1"',
-      "soundboard-volume", pct
+      'sink_exists soundboard.mix && pactl set-sink-volume soundboard.mix 100%',
+      "soundboard-volume-normalize"
     ])
   }
 
@@ -555,6 +568,7 @@ Scope {
         root.audioStatus = "ready"
         root.audioReady = true
         root.lastError = ""
+        root._normalizeMixVolume()   // sink is a bus, not a gain stage
       } else {
         root.audioStatus = "error"
         root.audioReady = false

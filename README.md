@@ -141,13 +141,20 @@ generated binds call.
    via your normal input.
 3. Load a few pads from the panel's settings drawer (wav/mp3/flac/ogg play
    natively; m4a/opus/webm go through ffmpeg, which must be installed).
-4. `Master volume` scales the mix; `monitorLocally` (default on) also plays
-   pads through your normal default sink so you hear them too.
+4. `Master volume` scales the pads only (your voice stays at unity, so you are
+   never quieter to the far end); `monitorLocally` (default on) also plays
+   the pads through your normal default sink, at that same gain — what you
+   hear locally is what the other side hears.
 
 ## Widget settings
 
-- `masterVolume` — 0..1, applied to the `soundboard.mix` sink volume.
-- `monitorLocally` — mirrored playback on the system default sink.
+- `masterVolume` — 0..1, applied as per-pad stream gain (pad volume × master).
+  It is deliberately **not** applied to the `soundboard.mix` sink: that sink is
+  a summing bus that also carries your voice loopback, so scaling it would
+  attenuate you as well. The sink is kept at 100 %.
+- `monitorLocally` — mirrored playback on the system default sink, at the same
+  effective gain, so the local preview matches the far end (0 % is silent
+  everywhere).
 - `micSource` — empty string = auto (`omavoice` → default → first hardware);
   or pin an explicit PipeWire source node name.
 
